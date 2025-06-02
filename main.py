@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 
 from dotenv import load_dotenv
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2 import service_account
 
 load_dotenv()
 
@@ -19,7 +19,7 @@ def get_months_and_fortnights():
     """
     months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
     fortnights = ["1", "2"]
-    return [f"{month} - {fortnight}" for month in months for fortnight in fortnights]
+    return ["Select a month..."] + [f"{month} - {fortnight}" for month in months for fortnight in fortnights] + ["Test mayo - 1"]
 
 
 def format_main_table(table):
@@ -82,7 +82,7 @@ def format_main_table(table):
         total = line[5].replace(',', '.') if line[5] else "0"
 
         result.append({
-            'Matrícula': matricula,
+            'Matricula': matricula,
             'Fecha': fecha,
             'Artículo': articulo,
             'Descripción': descripcion,
@@ -219,9 +219,9 @@ def find_worksheet_by_month_fortnight(month_fortnight):
         gspread.Worksheet or None: The matching worksheet or None if not found
     """
     # Get the spreadsheet
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    key_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY", "keys/service-account.json")
-    creds = ServiceAccountCredentials.from_json_keyfile_name(key_path, scope)
+    scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    key_path = "keys/service-account.json"
+    creds = service_account.Credentials.from_service_account_file(key_path, scopes=scopes)
     client = gspread.authorize(creds)
     
     spreadsheet = client.open_by_url(os.getenv("SPREADSHEET_URL"))
@@ -264,7 +264,7 @@ def parse_spreadsheet_data(data, fortnight):
         fortnight (str): Fortnight number ("1" or "2")
         
     Returns:
-        pd.DataFrame: DataFrame with Matrícula and Importe_Spreadsheet columns
+        pd.DataFrame: DataFrame with Matricula and Importe_Spreadsheet columns
     """
     # Look for the fortnight header row
     fortnight_key = f"Quincena {fortnight}"
@@ -321,7 +321,7 @@ def parse_spreadsheet_data(data, fortnight):
         
         # Add the row (matricula can be empty but importe cannot)
         vehicles_data.append({
-            'Matrícula': matricula,
+            'Matricula': matricula,
             'Importe_Spreadsheet': importe
         })
     
@@ -334,21 +334,23 @@ def compare_pdf_spreadsheet(df_pdf, df_spreadsheet):
     Compare PDF invoice data with spreadsheet data by vehicle registration.
     
     Groups PDF data by vehicle registration and compares totals with spreadsheet amounts.
-    Calculates differences and provides status indicators.
+    Calculates differences and provides status indicators. For vehicles with differences,
+    provides detailed item-level mapping based on amounts.
     
     Args:
-        df_pdf (pd.DataFrame): PDF invoice data
-        df_spreadsheet (pd.DataFrame): Spreadsheet data
+        df_pdf (pd.DataFrame): PDF invoice data with columns: Matricula, Fecha, Artículo, Descripción, Cantidad, Precio, Descuento, Total
+        df_spreadsheet (pd.DataFrame): Spreadsheet data with columns: Matricula, Importe_Spreadsheet
         
     Returns:
-        tuple: (df_comparison, total_pdf, total_diff) - comparison DataFrame and totals
+        tuple: (df_comparison, total_pdf, total_diff, detailed_differences) 
+               - comparison DataFrame, totals, and detailed item differences
     """
     # Group PDF data by matricula and sum totals
-    df_pdf_grouped = df_pdf.groupby('Matrícula')['Total'].sum().reset_index()
+    df_pdf_grouped = df_pdf.groupby('Matricula')['Total'].sum().reset_index()
     df_pdf_grouped.rename(columns={'Total': 'Importe_PDF'}, inplace=True)
     
     # Merge the dataframes on vehicle registration
-    df_comparison = pd.merge(df_pdf_grouped, df_spreadsheet, on='Matrícula', how='outer')
+    df_comparison = pd.merge(df_pdf_grouped, df_spreadsheet, on='Matricula', how='outer')
     
     # Fill NaN values with 0 for missing entries
     df_comparison['Importe_PDF'] = df_comparison['Importe_PDF'].fillna(0)
@@ -362,6 +364,103 @@ def compare_pdf_spreadsheet(df_pdf, df_spreadsheet):
         lambda x: '✅ Coincide' if abs(x) < 0.01 else ('📈 PDF Mayor' if x > 0 else '📉 Spreadsheet Mayor')
     )
     
+    # Find detailed differences for vehicles that don't match
+    detailed_differences = {}
+    
+    # Get vehicles with differences (tolerance of 0.01 for floating point comparison)
+    vehicles_with_differences = df_comparison[abs(df_comparison['Diferencia']) >= 0.01]['Matricula'].tolist()
+    
+    for matricula in vehicles_with_differences:
+        # Get PDF items for this vehicle
+        pdf_items = df_pdf[df_pdf['Matricula'] == matricula].copy()
+        
+        # Get spreadsheet amount for this vehicle
+        spreadsheet_amount = df_spreadsheet[df_spreadsheet['Matricula'] == matricula]['Importe_Spreadsheet'].sum()
+        
+        if len(pdf_items) > 0:
+            # Create detailed comparison for this vehicle
+            vehicle_details = {
+                'matricula': matricula,
+                'pdf_total': pdf_items['Total'].sum(),
+                'spreadsheet_total': spreadsheet_amount,
+                'difference': pdf_items['Total'].sum() - spreadsheet_amount,
+                'pdf_items': [],
+                'potential_matches': []
+            }
+            
+            # Add all PDF items for this vehicle
+            for _, item in pdf_items.iterrows():
+                vehicle_details['pdf_items'].append({
+                    'fecha': item['Fecha'],
+                    'articulo': item['Artículo'],
+                    'descripcion': item['Descripción'],
+                    'cantidad': item['Cantidad'],
+                    'precio': item['Precio'],
+                    'descuento': item['Descuento'],
+                    'total': item['Total']
+                })
+            
+            # Try to find potential matches based on amount
+            if spreadsheet_amount != 0:
+                # Look for PDF items that could match the spreadsheet amount
+                tolerance = 0.01
+                
+                # Check if any single PDF item matches the spreadsheet amount
+                for _, item in pdf_items.iterrows():
+                    if abs(item['Total'] - spreadsheet_amount) < tolerance:
+                        vehicle_details['potential_matches'].append({
+                            'type': 'exact_item_match',
+                            'pdf_item': {
+                                'articulo': item['Artículo'],
+                                'descripcion': item['Descripción'],
+                                'total': item['Total']
+                            },
+                            'spreadsheet_amount': spreadsheet_amount,
+                            'difference': item['Total'] - spreadsheet_amount
+                        })
+                
+                # Check if combination of items could match
+                if len(pdf_items) > 1:
+                    # Try combinations of 2 items
+                    for i in range(len(pdf_items)):
+                        for j in range(i + 1, len(pdf_items)):
+                            combo_total = pdf_items.iloc[i]['Total'] + pdf_items.iloc[j]['Total']
+                            if abs(combo_total - spreadsheet_amount) < tolerance:
+                                vehicle_details['potential_matches'].append({
+                                    'type': 'combo_match',
+                                    'pdf_items': [
+                                        {
+                                            'articulo': pdf_items.iloc[i]['Artículo'],
+                                            'descripcion': pdf_items.iloc[i]['Descripción'],
+                                            'total': pdf_items.iloc[i]['Total']
+                                        },
+                                        {
+                                            'articulo': pdf_items.iloc[j]['Artículo'],
+                                            'descripcion': pdf_items.iloc[j]['Descripción'],
+                                            'total': pdf_items.iloc[j]['Total']
+                                        }
+                                    ],
+                                    'combo_total': combo_total,
+                                    'spreadsheet_amount': spreadsheet_amount,
+                                    'difference': combo_total - spreadsheet_amount
+                                })
+                
+                # If no exact matches found, find closest amounts
+                if not vehicle_details['potential_matches']:
+                    closest_item = pdf_items.loc[pdf_items['Total'].sub(spreadsheet_amount).abs().idxmin()]
+                    vehicle_details['potential_matches'].append({
+                        'type': 'closest_match',
+                        'pdf_item': {
+                            'articulo': closest_item['Artículo'],
+                            'descripcion': closest_item['Descripción'],
+                            'total': closest_item['Total']
+                        },
+                        'spreadsheet_amount': spreadsheet_amount,
+                        'difference': closest_item['Total'] - spreadsheet_amount
+                    })
+            
+            detailed_differences[matricula] = vehicle_details
+    
     # Sort by absolute difference (largest differences first)
     df_comparison['Diferencia_Abs'] = abs(df_comparison['Diferencia'])
     df_comparison = df_comparison.sort_values('Diferencia_Abs', ascending=False)
@@ -372,138 +471,191 @@ def compare_pdf_spreadsheet(df_pdf, df_spreadsheet):
     total_spreadsheet = df_spreadsheet['Importe_Spreadsheet'].sum()
     total_diff = total_pdf - total_spreadsheet
     
-    return df_comparison, total_pdf, total_diff
+    return df_comparison, total_pdf, total_diff, detailed_differences
+
+
+def display_detailed_differences(detailed_differences):
+    """
+    Display detailed item-level differences for vehicles that don't match.
+    
+    Args:
+        detailed_differences (dict): Dictionary containing detailed difference information
+    """
+    if not detailed_differences:
+        return
+    
+    st.markdown("### 🔍 Análisis Detallado de Diferencias")
+    
+    for matricula, details in detailed_differences.items():
+        with st.expander(f"🚗 {matricula} - Diferencia: €{details['difference']:.2f}"):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**📄 Items en PDF:**")
+                for item in details['pdf_items']:
+                    st.write(f"• {item['articulo']} - {item['descripcion']}")
+                    st.write(f"  Cantidad: {item['cantidad']}, Precio: €{item['precio']:.2f}, Total: €{item['total']:.2f}")
+                
+                st.markdown(f"**Total PDF: €{details['pdf_total']:.2f}**")
+            
+            with col2:
+                st.markdown(f"**📊 Importe Spreadsheet: €{details['spreadsheet_total']:.2f}**")
+                
+                if details['potential_matches']:
+                    st.markdown("**🎯 Posibles Coincidencias:**")
+                    for match in details['potential_matches']:
+                        if match['type'] == 'exact_item_match':
+                            st.success(f"✅ Coincidencia exacta encontrada:")
+                            st.write(f"• {match['pdf_item']['articulo']} - {match['pdf_item']['descripcion']}")
+                            st.write(f"  Total: €{match['pdf_item']['total']:.2f}")
+                        elif match['type'] == 'combo_match':
+                            st.info(f"🔗 Combinación de items:")
+                            for pdf_item in match['pdf_items']:
+                                st.write(f"• {pdf_item['articulo']} - €{pdf_item['total']:.2f}")
+                            st.write(f"  Total combinado: €{match['combo_total']:.2f}")
+                        elif match['type'] == 'closest_match':
+                            st.warning(f"📍 Item más cercano:")
+                            st.write(f"• {match['pdf_item']['articulo']} - {match['pdf_item']['descripcion']}")
+                            st.write(f"  Total: €{match['pdf_item']['total']:.2f}")
+                            st.write(f"  Diferencia: €{match['difference']:.2f}")
+                else:
+                    st.error("❌ No se encontraron coincidencias potenciales")
 
 
 if __name__ == "__main__":
-    # Streamlit UI setup (commented out for testing)
-    # st.set_page_config(layout="wide")  
-    # st.title("💸 Facturing")
-
-    # # Create a smaller selectbox using columns
-    # col1, col2, col3 = st.columns([1, 2, 3])
-    # with col1:
-    #     month_fortnight = st.selectbox("Select the month and fortnight", 
-    #                                    get_months_and_fortnights(), 
-    #                                    index=0, 
-    #                                    label_visibility="collapsed")
-
-    # Test configuration
-    month_fortnight = "Test mayo - 1"
-
-    # Search for the worksheet that contains the selected month
-    sheet = find_worksheet_by_month_fortnight(month_fortnight)
     
-    if sheet is None:
-        st.error(f"Could not find worksheet for '{month_fortnight}'")
-        st.stop()
-    else:
-        st.success(f"Found worksheet: '{sheet.title}'")
+    st.set_page_config(layout="wide")  
+    st.title("💸 Facturing")
 
-    # Get the data from the spreadsheet
-    data = sheet.get_all_values()
-    
-    # Extract fortnight number from selection (e.g., "May - 1" -> "1")
-    fortnight = month_fortnight.split(" - ")[1]
-    
-    # Parse spreadsheet data for the selected fortnight
-    df_spreadsheet = parse_spreadsheet_data(data, fortnight)
-    
-    if df_spreadsheet.empty:
-        st.warning(f"No data found for Quincena {fortnight} in the spreadsheet")
-    else:
-        st.success(f"Found {len(df_spreadsheet)} vehicles in Quincena {fortnight}")
+    # Create a smaller selectbox using columns
+    col1, col2, col3 = st.columns([1, 2, 3])
+    with col1:
+        month_fortnight = st.selectbox("Select the month and fortnight", 
+                                       get_months_and_fortnights(), 
+                                       index=0, 
+                                       label_visibility="collapsed")
 
-    # PDF upload and processing
-    pdf_path = st.file_uploader("Upload a PDF file", type="pdf")
-
-    if pdf_path:
-        # Extract data from PDF
-        df, before_taxes, iva, after_taxes = read_pdf(pdf_path)
+    # Only proceed if a valid month is selected
+    if month_fortnight != "Select a month...":
+        # Search for the worksheet that contains the selected month
+        sheet = find_worksheet_by_month_fortnight(month_fortnight)
         
-        # Compare PDF data with spreadsheet data if available
-        if not df_spreadsheet.empty:
-            df_comparison, total_pdf, total_diff = compare_pdf_spreadsheet(df, df_spreadsheet)
+        if sheet is None:
+            st.error(f"Could not find worksheet for '{month_fortnight}'")
+            st.stop()
+        else:
+            st.success(f"Found worksheet: '{sheet.title}'")
+
+        # Get the data from the spreadsheet
+        data = sheet.get_all_values()
+        
+        # Extract fortnight number from selection (e.g., "May - 1" -> "1")
+        fortnight = month_fortnight.split(" - ")[1]
+        
+        # Parse spreadsheet data for the selected fortnight
+        df_spreadsheet = parse_spreadsheet_data(data, fortnight)
+        
+
+        if df_spreadsheet.empty:
+            st.warning(f"No data found for Quincena {fortnight} in the spreadsheet")
+        else:
+            st.success(f"Found {len(df_spreadsheet)} vehicles in Quincena {fortnight}")
+
+        # PDF upload and processing
+        pdf_path = st.file_uploader("Upload a PDF file", type="pdf")
+
+        if pdf_path:
+            # Extract data from PDF
+            df, before_taxes, iva, after_taxes = read_pdf(pdf_path)
             
-            st.markdown("## 📊 Comparación PDF vs Spreadsheet")
+            # Compare PDF data with spreadsheet data if available
+            if not df_spreadsheet.empty:
+                df_comparison, total_pdf, total_diff, detailed_differences = compare_pdf_spreadsheet(df, df_spreadsheet)
+                
+                st.markdown("## 📊 Comparación PDF vs Spreadsheet")
+                
+                # Display summary metrics
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric(
+                        label="💰 Total PDF",
+                        value=f"€{total_pdf:.2f}"
+                    )
+                with col2:
+                    st.metric(
+                        label="⚖️ Diferencia",
+                        value=f"€{total_diff:.2f}",
+                        delta=f"{total_diff:.2f}"
+                    )
+                with col3:
+                    matches = len(df_comparison[abs(df_comparison['Diferencia']) < 0.01])
+                    total_vehicles = len(df_comparison)
+                    st.metric(
+                        label="✅ Coincidencias",
+                        value=f"{matches}/{total_vehicles}"
+                    )
+                
+                # Display comparison table
+                st.markdown("### 🚗 Comparación por Vehículo")
+                
+                # Format the comparison dataframe for better display
+                df_display = df_comparison.copy()
+                df_display['Importe_PDF'] = df_display['Importe_PDF'].apply(lambda x: f"€{x:.2f}")
+                df_display['Importe_Spreadsheet'] = df_display['Importe_Spreadsheet'].apply(lambda x: f"€{x:.2f}")
+                df_display['Diferencia'] = df_display['Diferencia'].apply(lambda x: f"€{x:.2f}")
+                
+                # Rename columns for display
+                df_display.columns = ['Matricula', 'PDF', 'Spreadsheet', 'Diferencia', 'Estado']
+                
+                st.dataframe(df_display, use_container_width=True, hide_index=True)
+                
+                # Show vehicles that appear only in one source
+                only_pdf = df_comparison[df_comparison['Importe_Spreadsheet'] == 0]
+                only_spreadsheet = df_comparison[df_comparison['Importe_PDF'] == 0]
+                
+                if not only_pdf.empty:
+                    st.markdown("### 🚨 Vehículos solo en PDF")
+                    st.dataframe(only_pdf[['Matricula', 'Importe_PDF']], hide_index=True)
+                
+                if not only_spreadsheet.empty:
+                    st.markdown("### 🚨 Vehículos solo en Spreadsheet")
+                    st.dataframe(only_spreadsheet[['Matricula', 'Importe_Spreadsheet']], hide_index=True)
             
-            # Display summary metrics
+            # Group PDF data by vehicle registration for summary
+            df_grouped = df.groupby('Matricula')['Total'].sum().reset_index()
+            df_grouped = df_grouped.sort_values(by='Total', ascending=False)
+
+            st.markdown("## 📋 Resumen PDF por Vehículo")
+            st.dataframe(df_grouped, width=300, hide_index=True)
+
+            st.markdown("---")  # Add a separator line
+
+            # Display detailed item breakdown
+            st.markdown("## 📄 Detalle de Todos los Artículos")
+            st.dataframe(df, use_container_width=True, width=1500, hide_index=True)
+
+            # Display PDF totals summary
+            st.markdown("---")  # Add a separator line
+            st.markdown("## 💰 Totales del PDF")
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric(
-                    label="💰 Total PDF",
-                    value=f"€{total_pdf:.2f}"
+                    label="💰 Antes de impuestos",
+                    value=f"€{before_taxes:.2f}"
                 )
             with col2:
                 st.metric(
-                    label="⚖️ Diferencia",
-                    value=f"€{total_diff:.2f}",
-                    delta=f"{total_diff:.2f}"
+                    label="📊 IVA (21%)",
+                    value=f"€{iva:.2f}"
                 )
             with col3:
-                matches = len(df_comparison[abs(df_comparison['Diferencia']) < 0.01])
-                total_vehicles = len(df_comparison)
                 st.metric(
-                    label="✅ Coincidencias",
-                    value=f"{matches}/{total_vehicles}"
+                    label="💸 Total",
+                    value=f"€{after_taxes:.2f}"
                 )
-            
-            # Display comparison table
-            st.markdown("### 🚗 Comparación por Vehículo")
-            
-            # Format the comparison dataframe for better display
-            df_display = df_comparison.copy()
-            df_display['Importe_PDF'] = df_display['Importe_PDF'].apply(lambda x: f"€{x:.2f}")
-            df_display['Importe_Spreadsheet'] = df_display['Importe_Spreadsheet'].apply(lambda x: f"€{x:.2f}")
-            df_display['Diferencia'] = df_display['Diferencia'].apply(lambda x: f"€{x:.2f}")
-            
-            # Rename columns for display
-            df_display.columns = ['Matrícula', 'PDF', 'Spreadsheet', 'Diferencia', 'Estado']
-            
-            st.dataframe(df_display, use_container_width=True, hide_index=True)
-            
-            # Show vehicles that appear only in one source
-            only_pdf = df_comparison[df_comparison['Importe_Spreadsheet'] == 0]
-            only_spreadsheet = df_comparison[df_comparison['Importe_PDF'] == 0]
-            
-            if not only_pdf.empty:
-                st.markdown("### 🚨 Vehículos solo en PDF")
-                st.dataframe(only_pdf[['Matrícula', 'Importe_PDF']], hide_index=True)
-            
-            if not only_spreadsheet.empty:
-                st.markdown("### 🚨 Vehículos solo en Spreadsheet")
-                st.dataframe(only_spreadsheet[['Matrícula', 'Importe_Spreadsheet']], hide_index=True)
-        
-        # Group PDF data by vehicle registration for summary
-        df_grouped = df.groupby('Matrícula')['Total'].sum().reset_index()
-        df_grouped = df_grouped.sort_values(by='Total', ascending=False)
 
-        st.markdown("## 📋 Resumen PDF por Vehículo")
-        st.dataframe(df_grouped, width=300, hide_index=True)
-
-        st.markdown("---")  # Add a separator line
-
-        # Display detailed item breakdown
-        st.markdown("## 📄 Detalle de Todos los Artículos")
-        st.dataframe(df, use_container_width=True, width=1500, hide_index=True)
-
-        # Display PDF totals summary
-        st.markdown("---")  # Add a separator line
-        st.markdown("## 💰 Totales del PDF")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric(
-                label="💰 Antes de impuestos",
-                value=f"€{before_taxes:.2f}"
-            )
-        with col2:
-            st.metric(
-                label="📊 IVA (21%)",
-                value=f"€{iva:.2f}"
-            )
-        with col3:
-            st.metric(
-                label="💸 Total",
-                value=f"€{after_taxes:.2f}"
-            )
+            # Display detailed differences
+            display_detailed_differences(detailed_differences)
+    else:
+        st.info("👆 Please select a month and fortnight to begin processing.")
 

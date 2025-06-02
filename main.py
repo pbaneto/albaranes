@@ -40,6 +40,10 @@ def format_main_table(table):
         if "Artículo" in line:
             header_idx = idx
             break
+    else:
+        # Header not found – return empty list instead of crashing
+        st.warning("No se encontró la cabecera 'Artículo' en la tabla PDF.")
+        return []
 
     result = []
     matricula = ''
@@ -68,10 +72,14 @@ def format_main_table(table):
         # Extract item details from data rows
         articulo = line[0]
         descripcion = line[1]
-        cantidad = line[2]
-        precio = line[3].replace(',', '.')  # Convert Spanish decimal format
-        descuento = line[4]
-        total = line[5].replace(',', '.')   # Convert Spanish decimal format
+        cantidad = line[2].replace(',', '.') if line[2] else "0"
+        # Normalise price and total
+        precio = line[3].replace(',', '.') if line[3] else "0"
+        # Strip possible % and convert decimal comma
+        descuento = (
+            line[4].replace('%', '').replace(',', '.') if line[4] else "0"
+        )
+        total = line[5].replace(',', '.') if line[5] else "0"
 
         result.append({
             'Matrícula': matricula,
@@ -212,7 +220,8 @@ def find_worksheet_by_month_fortnight(month_fortnight):
     """
     # Get the spreadsheet
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("keys/gen-lang-client-0125166661-7a68f39a8157.json", scope)
+    key_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY", "keys/service-account.json")
+    creds = ServiceAccountCredentials.from_json_keyfile_name(key_path, scope)
     client = gspread.authorize(creds)
     
     spreadsheet = client.open_by_url(os.getenv("SPREADSHEET_URL"))
@@ -274,7 +283,7 @@ def parse_spreadsheet_data(data, fortnight):
             break
     
     if header_row is None:
-        return pd.DataFrame(), 0.0
+        return pd.DataFrame()
     
     # Calculate column positions for matricula and importe
     matricula_col = fortnight_col_start + 2
